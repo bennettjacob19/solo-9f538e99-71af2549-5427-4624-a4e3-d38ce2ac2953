@@ -67,19 +67,34 @@
   <section class="card full">
     <h2>③ 选择提交点查看旧值（点击一行 = 查看该点整目录）</h2>
     <table>
-      <thead><tr><th>类型</th><th>提交点 LSN</th><th>源事务 xid</th><th>提交时间</th><th>变更行数</th></tr></thead>
-      <tbody id="points"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
+      <thead><tr><th>类型</th><th>提交点 LSN</th><th>源事务 xid</th><th>提交时间</th><th>变更行数</th><th>基线固化</th></tr></thead>
+      <tbody id="points"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
     </table>
     <div id="dir-wrap" style="margin-top:14px;"></div>
   </section>
 
   <section class="card full">
-    <h2>④ 单编号完整历史（含删除/重用）</h2>
+    <h2>④ 单编号完整历史（当前基线起，含删除/重用）</h2>
     <div style="display:flex; gap:8px; max-width:420px;">
       <input id="hist-no" type="number" min="1" placeholder="制品编号，如 1001">
       <button onclick="loadHistory()">查询</button>
     </div>
     <div id="hist-wrap" style="margin-top:10px;"></div>
+  </section>
+
+  <section class="card full">
+    <h2>⑤ 基线固化 / 历史清理（控制 SQLite 历史库增长）</h2>
+    <div class="muted" style="margin-bottom:8px;">
+      在上方提交点表点击“固化为新基线”：该点整张目录将原子替换为新基线，更早的逐笔变更与提交点被清除且
+      <b>明确不可再查</b>；该点及之后的目录、自新基线起的单编号历史保持准确，清理后自动 VACUUM 回收空间。
+      清理与逻辑复制捕获可并发执行，崩溃重启不会出现半份基线或重复变更。
+    </div>
+    <div style="display:flex; gap:8px; max-width:520px;">
+      <input id="freeze-lsn" placeholder="或手动输入保留起点 LSN，如 0/16B3748">
+      <button class="primary" onclick="freezeBaseline()">固化为新基线</button>
+    </div>
+    <div class="msg" id="freeze-msg"></div>
+    <div id="retention-wrap" style="margin-top:10px;"></div>
   </section>
 </main>
 
@@ -104,11 +119,14 @@ async function refreshProgress(){
     document.getElementById('progress').innerHTML = `
       <div>状态</div><div><span class="badge ${esc(p.phase)}">${esc(p.phase)}</span></div>
       <div>复制槽</div><div><code>${esc(p.slot_name ?? '-')}</code></div>
-      <div>基线 LSN</div><div><code>${esc(p.baseline_lsn ?? '-')}</code></div>
+      <div>当前基线 LSN</div><div><code>${esc(p.baseline_lsn ?? '-')}</code></div>
+      <div>保留起点（早于此不可查）</div><div><code>${esc(p.retention_horizon_lsn ?? '尚未固化')}</code></div>
       <div>最近提交点</div><div><code>${esc(p.last_commit_lsn ?? '-')}</code></div>
       <div>最近流消息 LSN</div><div><code>${esc(p.last_message_lsn ?? '-')}</code></div>
       <div>已捕获事务数</div><div>${p.captured_transactions ?? 0}</div>
       <div>历史日志行数</div><div>${p.history_rows ?? 0}</div>
+      <div>数据库页数</div><div>${p.db_pages ?? '-'}（固化后 VACUUM 回收）</div>
+      <div>固化次数</div><div>${p.retention_count ?? 0}</div>
       <div>最近错误</div><div>${p.last_error ? '<span style="color:var(--err)">'+esc(p.last_error)+'</span>' : '无'}</div>`;
   } catch(e){ document.getElementById('progress').innerHTML = '<div class="msg err">'+esc(e.message)+'</div>'; }
 }
@@ -168,7 +186,7 @@ async function refreshPoints(){
   try {
     const r = await getJSON('/api/points');
     pointsCache = r.points;
-    if (!r.points.length) { tb.innerHTML='<tr><td colspan="5" class="muted">暂无提交点</td></tr>'; return; }
+    if (!r.points.length) { tb.innerHTML='<tr><td colspan="6" class="muted">暂无提交点</td></tr>'; return; }
     tb.innerHTML = r.points.map(p => `
       <tr class="point-row" onclick="viewDirectory('${esc(p.lsn)}')">
         <td><span class="tag ${p.kind}">${esc(p.kind)}</span></td>
@@ -176,22 +194,68 @@ async function refreshPoints(){
         <td>${p.xid ?? '—'}</td>
         <td>${esc(p.commit_ts ?? '—')}</td>
         <td>${p.change_count}</td>
+        <td><button class="danger" onclick="freezeAt(event,'${esc(p.lsn)}')">固化为新基线</button></td>
       </tr>`).join('');
   } catch(e){
-    tb.innerHTML = `<tr><td colspan="5" class="msg err">${esc(e.status===503 ? '初始化未完成，历史暂不开放' : e.message)}</td></tr>`;
+    tb.innerHTML = `<tr><td colspan="6" class="msg err">${esc(e.status===503 ? '初始化未完成，历史暂不开放' : e.message)}</td></tr>`;
   }
 }
 
 async function viewDirectory(lsn){
-  const r = await getJSON('/api/directory?point='+encodeURIComponent(lsn));
-  const rows = r.artifacts;
-  document.getElementById('dir-wrap').innerHTML = `
-    <h3 style="font-size:14px;margin:6px 0;">提交点 <code>${esc(lsn)}</code> 的整张目录（${rows.length} 行）</h3>
-    <table><thead><tr><th>制品编号</th><th>服务名</th><th>版本</th><th>SHA-256</th><th>来源</th></tr></thead>
-    <tbody>${rows.map(a=>`<tr><td>${a.artifact_no}</td><td>${esc(a.service_name)}</td>
-      <td>${esc(a.version)}</td><td><code>${esc(a.sha256)}</code></td>
-      <td><span class="tag ${esc(a.change_type)}">${esc(a.change_type)}</span></td></tr>`).join('')
-      || '<tr><td colspan="5" class="muted">该时刻目录为空</td></tr>'}</tbody></table>`;
+  try {
+    const r = await getJSON('/api/directory?point='+encodeURIComponent(lsn));
+    const rows = r.artifacts;
+    document.getElementById('dir-wrap').innerHTML = `
+      <h3 style="font-size:14px;margin:6px 0;">提交点 <code>${esc(lsn)}</code> 的整张目录（${rows.length} 行）</h3>
+      <table><thead><tr><th>制品编号</th><th>服务名</th><th>版本</th><th>SHA-256</th><th>来源</th></tr></thead>
+      <tbody>${rows.map(a=>`<tr><td>${a.artifact_no}</td><td>${esc(a.service_name)}</td>
+        <td>${esc(a.version)}</td><td><code>${esc(a.sha256)}</code></td>
+        <td><span class="tag ${esc(a.change_type)}">${esc(a.change_type)}</span></td></tr>`).join('')
+        || '<tr><td colspan="5" class="muted">该时刻目录为空</td></tr>'}</tbody></table>`;
+  } catch(e){
+    const hint = e.status === 410
+      ? '（该提交点早于保留起点，逐笔历史已被固化清理）' : '';
+    document.getElementById('dir-wrap').innerHTML =
+      '<div class="msg err">'+esc(e.message)+hint+'</div>';
+  }
+}
+
+// ------------------------------------------------------------- 基线固化
+function freezeAt(ev, lsn){
+  ev.stopPropagation();  // 不触发行点击的目录回看
+  document.getElementById('freeze-lsn').value = lsn;
+  freezeBaseline();
+}
+async function freezeBaseline(){
+  const lsn = document.getElementById('freeze-lsn').value.trim();
+  if (!lsn) return setMsg('freeze-msg','请先选择或输入保留起点 LSN','err');
+  if (!confirm('确认把提交点 '+lsn+' 的整张目录固化为新基线？\n\n更早的逐笔变更与提交点将被清除且不可再查，该操作不可撤销。')) return;
+  setMsg('freeze-msg','正在原子固化并 VACUUM…','');
+  try {
+    const r = await getJSON('/api/retention/freeze', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({point: lsn})
+    });
+    const vac = r.vacuum_error ? ('；VACUUM 失败(不影响固化): '+r.vacuum_error)
+      : `；页数 ${r.db_pages_before} → ${r.db_pages_after}`;
+    setMsg('freeze-msg',
+      `固化完成：新基线 ${r.new_baseline_rows} 行，清除事务 ${r.removed_txns} 个、变更行 ${r.removed_history_rows} 行${vac}`, 'ok');
+    document.getElementById('freeze-lsn').value='';
+    refreshPoints(); refreshProgress(); refreshRetention();
+  } catch(e){ setMsg('freeze-msg','固化失败（数据未改动）：'+e.message, 'err'); }
+}
+async function refreshRetention(){
+  const wrap = document.getElementById('retention-wrap');
+  try {
+    const r = await getJSON('/api/retention/events');
+    if (!r.events.length) { wrap.innerHTML='<div class="muted">尚无固化记录</div>'; return; }
+    wrap.innerHTML = `<table><thead><tr><th>#</th><th>保留起点 LSN</th><th>清除事务</th>
+      <th>清除变更行</th><th>新基线行</th><th>页数(前→后)</th><th>时间</th></tr></thead><tbody>
+      ${r.events.map(e=>`<tr><td>${e.id}</td><td><code>${esc(e.point_lsn)}</code></td>
+        <td>${e.removed_txns}</td><td>${e.removed_history_rows}</td><td>${e.new_baseline_rows}</td>
+        <td>${e.db_pages_before ?? '—'} → ${e.db_pages_after ?? '—'}</td>
+        <td class="muted">${esc(e.created_at)}</td></tr>`).join('')}</tbody></table>`;
+  } catch(e){ wrap.innerHTML='<div class="msg err">'+esc(e.message)+'</div>'; }
 }
 
 // ---------------------------------------------------------------- 单编号历史
@@ -213,7 +277,7 @@ async function loadHistory(){
 }
 
 addOp('insert');
-refreshProgress(); refreshPoints();
+refreshProgress(); refreshPoints(); refreshRetention();
 setInterval(refreshProgress, 3000);
 setInterval(refreshPoints, 5000);
 </script>

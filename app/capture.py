@@ -246,19 +246,26 @@ class CaptureWorker:
             commit_ts = raw_commit_msg.split(marker, 1)[1].rstrip(")")
 
         lsn_text = f"{commit_lsn >> 32:X}/{commit_lsn & 0xFFFFFFFF:08X}"
-        written = self._store.persist_transaction(
+        outcome = self._store.persist_transaction(
             xid, lsn_text, commit_ts, changes
         )
-        if written:
+        if outcome == "written":
             log.info(
                 "txn %s persisted at %s with %d change(s)",
                 xid, lsn_text, len(changes),
             )
-        else:
+        elif outcome == "duplicate":
             log.info("txn %s replayed after restart, skipped (idempotent)", xid)
+        else:  # before_horizon：已被基线固化清理的旧事务，拒绝重现
+            log.warning(
+                "txn %s at %s is older than retention horizon, not restored",
+                xid, lsn_text,
+            )
 
-        # 数据已落盘（或此前已落盘）——现在才通过复制协议向源端确认，
-        # 推进该槽的 confirmed_flush_lsn。绝不在落盘前发送 feedback。
+        # 数据已落盘（或此前已落盘、或已被明确清理）——现在才通过复制协议
+        # 向源端确认，推进该槽的 confirmed_flush_lsn。绝不在落盘前发送 feedback。
+        # before_horizon 的事务同样确认：它的数据已由新基线覆盖，卡住槽位
+        # 只会让源端 WAL 无意义增长，且该事务永远不应再写回历史库。
         msg.cursor.send_feedback(flush_lsn=commit_lsn)
         self._current_changes = []
         self._current_xid = None

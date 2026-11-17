@@ -26,6 +26,9 @@ class Settings:
     # 直到基线落盘后才提交：确定性地构造"基线前开始、基线后提交"的事务。
     inflight_hook_no: int = int(_env("TEST_INFLIGHT_ARTIFACT_NO", "0"))
     inflight_hook_sleep_s: float = float(_env("TEST_INFLIGHT_SLEEP_S", "3"))
+    # 显式置 1 才允许基线固化的"COMMIT 前强杀"崩溃钩子；默认禁用，
+    # 生产环境下 API 即使带上该字段也只会被忽略。
+    enable_freeze_crash_hook: bool = _env("TEST_FREEZE_CRASH_HOOK", "0") == "1"
 
     # ---- 本地历史库 SQLite ----
     sqlite_path: str = _env("SQLITE_PATH", "/tmp/capture/history.db")

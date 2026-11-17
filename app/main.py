@@ -17,7 +17,13 @@ from pydantic import BaseModel, Field, field_validator
 from .capture import CaptureWorker
 from .config import settings
 from .source import SourceDB, SourceError
-from .storage import HistoryStore, lsn_to_num
+from .storage import (
+    HistoryStore,
+    NotStreamingError,
+    PointNotCapturedError,
+    PointRetainedAwayError,
+    lsn_to_num,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,6 +76,13 @@ AnyOp = Annotated[
 
 class BatchRequest(BaseModel):
     operations: list[AnyOp] = Field(min_length=1)
+
+
+class RetainRequest(BaseModel):
+    """网页选定一个已捕获提交点，将该点目录固化为新基线。"""
+
+    point: str = Field(min_length=1, max_length=32)
+    crash_before_commit: bool = False  # 仅测试钩子使用，默认关闭
 
 
 store = HistoryStore(settings.sqlite_path)
@@ -152,9 +165,20 @@ def api_directory(point: str) -> JSONResponse:
         lsn_num = lsn_to_num(point)
     except (ValueError, IndexError):
         raise HTTPException(status_code=400, detail="point 必须是 LSN，形如 0/16B3748")
-    points = store.get_points()
-    valid_nums = {p["lsn_num"] for p in points}
-    if lsn_num not in valid_nums:
+    status = store.is_point_queryable(lsn_num)
+    if status == "gone":
+        # 旧提交点已被基线固化清理：明确告知不可查，而不是返回错误数据
+        raise HTTPException(
+            status_code=410,
+            detail={
+                "message": "该提交点早于保留起点，逐笔历史已被基线固化清理，不可查询",
+                "point": point,
+                "retention_horizon_lsn": store.get_progress().get(
+                    "retention_horizon_lsn"
+                ),
+            },
+        )
+    if status == "unknown":
         raise HTTPException(
             status_code=404,
             detail="该 LSN 不是已捕获的提交点，请先在 /api/points 中选择",
@@ -170,9 +194,41 @@ def api_directory(point: str) -> JSONResponse:
 
 @app.get("/api/history/{artifact_no}")
 def api_artifact_history(artifact_no: int) -> dict:
-    """单个制品编号的完整变更链；删除后重用编号，旧历史也全部保留。"""
+    """单个制品编号自当前基线起的完整变更链；删除后重用编号，旧历史也保留。"""
     _require_ready()
     return {
         "artifact_no": artifact_no,
         "history": store.get_history_of(artifact_no),
     }
+
+
+# ------------------------------------------------------------ 基线固化/清理
+@app.post("/api/retention/freeze")
+def api_freeze(req: RetainRequest) -> dict:
+    """把选定提交点的整张目录固化为新基线，清除更早的逐笔变更。"""
+    _require_ready()
+    try:
+        lsn_to_num(req.point)
+    except (ValueError, IndexError):
+        raise HTTPException(status_code=400, detail="point 必须是 LSN，形如 0/16B3748")
+    try:
+        # 崩溃钩子仅在显式环境变量开启时生效，生产环境强制忽略该字段
+        crash = req.crash_before_commit and settings.enable_freeze_crash_hook
+        result = store.freeze_baseline(
+            req.point, crash_before_commit=crash
+        )
+    except PointRetainedAwayError as exc:
+        raise HTTPException(status_code=410, detail=str(exc))
+    except PointNotCapturedError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except NotStreamingError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    log.info("baseline frozen at %s: %s", req.point, result)
+    return {"message": "基线固化完成", **result}
+
+
+@app.get("/api/retention/events")
+def api_retention_events() -> dict:
+    """历次基线固化（历史清理）审计记录。"""
+    _require_ready()
+    return {"events": store.get_retention_events()}
